@@ -393,15 +393,16 @@ def main():
     if php_ver:
         ok(f"PHP detected: {php_ver}")
         m_v = VERSION_RE.search(php_ver)
-        if m_v and int(m_v.group(1)) < 8:
-            warn(f"PHP {m_v.group(1)}.x — CVE-2026-109618/109619 affect PHP 8.x only")
-            print()
-            sys.exit(0)
+        if m_v:
+            major = int(m_v.group(1))
+            minor = int(m_v.group(2))
+            if major < 5 or (major == 5 and minor < 4):
+                warn("PHP < 5.4 — session.upload_progress not available, likely not vulnerable")
+            else:
+                ok("Version in affected range (5.4.0 – 8.5.x)")
         ver_verdict = version_verdict(php_ver)
         if ver_verdict == "FIXED":
             warn("Version appears patched — continuing anyway")
-        elif ver_verdict == "VULNERABLE":
-            ok("Version in vulnerable range")
     else:
         warn("X-Powered-By / Server header missing — cannot determine PHP version")
     sep()
