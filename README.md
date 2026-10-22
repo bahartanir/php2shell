@@ -2,9 +2,9 @@
 
 Independent security research on the critical PHP session.upload_progress vulnerabilities (CVSS v4.0 9.2).
 
-**Author:** Qi Deng ([@ikow](https://github.com/ikow))  
-**Date:** 2026-10-21  
-**Full writeup:** [qideng.substack.com](https://qideng.substack.com/)
+**Author:** Bahar Tanır ([@bahartanir](https://github.com/bahartanir))  
+**Date:** 2026-10-22  
+**Repository:** [github.com/bahartanir/php2shell](https://github.com/bahartanir/php2shell)
 
 ## Overview
 

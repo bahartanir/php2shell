@@ -157,7 +157,7 @@ session.serialize_handler = php_serialize
 ## POCs and Lab
 
 Verification POCs (no weaponized exploits) are available at:
-**[github.com/ikow/php2shell-poc](https://github.com/ikow/php2shell-poc)**
+**[github.com/bahartanir/php2shell](https://github.com/bahartanir/php2shell)**
 
 The repo includes a Docker lab setup and three verification scripts covering each attack chain.
 

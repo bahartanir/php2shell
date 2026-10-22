@@ -1,7 +1,7 @@
 # php2shell — Full Technical Analysis
 
 ## CVE-2026-109618 / CVE-2026-109619
-**Author:** Qi Deng  **Date:** 2026-10-21
+**Author:** Bahar Tanır  **Date:** 2026-10-22
 
 ---
 
